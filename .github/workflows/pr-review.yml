@@ -1,0 +1,82 @@
+name: 🤖 AI PR Review
+
+# ── Triggers ────────────────────────────────────────────────────────────────
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Allow maintainers to manually trigger a review via /review comment
+  issue_comment:
+    types: [created]
+
+# ── Permissions ─────────────────────────────────────────────────────────────
+# Minimal — GITHUB_TOKEN gets contents:read + pull-requests:write only.
+# We NEVER use pull_request_target to avoid pwn-request RCE.
+permissions:
+  contents: read
+  pull-requests: write
+
+# ── Concurrency ──────────────────────────────────────────────────────────────
+# One review per PR at a time. A new push cancels the in-flight review.
+concurrency:
+  group: ai-pr-review-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: AI Code Review
+    runs-on: ubuntu-latest
+
+    # ── Conditions ────────────────────────────────────────────────────────────
+    # Run on PR events OR on /review comment on a PR (not a plain issue)
+    if: |
+      (github.event_name == 'pull_request') ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '/review'))
+
+    steps:
+      # ── 1. Checkout (source code only, not PR code — no pwn-request risk) ──
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Check out the DEFAULT branch (where this workflow lives).
+          # We never checkout the PR head — no code execution from PRs.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+
+      # ── 2. Set up Python ────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: action_requirements.txt
+
+      # ── 3. Install minimal dependencies ─────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r action_requirements.txt
+
+      # ── 4. Run the AI PR review ──────────────────────────────────────────────
+      - name: Run AI PR Review
+        env:
+          # GITHUB_TOKEN is auto-minted per run — we never custody it
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # User's own OpenRouter key stored in repo/org secrets (BYOK)
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # Database — SQLite in the runner workspace (ephemeral, no persistence needed)
+          DATABASE_URL: "sqlite+aiosqlite:///./pr_review_action.db"
+          # Disable webhook secret requirement in Action mode
+          GITHUB_WEBHOOK_SECRET: "action_mode_no_webhook"
+          # App config
+          APP_ENV: "github_action"
+          LOG_LEVEL: "INFO"
+        run: python scripts/action_review.py
+
+      # ── 5. Upload logs on failure (helps debugging) ──────────────────────────
+      - name: Upload debug logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-review-logs
+          path: "*.log"
+          retention-days: 7
